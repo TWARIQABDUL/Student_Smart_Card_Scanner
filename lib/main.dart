@@ -1,6 +1,9 @@
+import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:http/http.dart' as http;
 
 void main() {
   runApp(const StudentScannerApp());
@@ -34,11 +37,24 @@ class ScannerHomePage extends StatefulWidget {
 class _ScannerHomePageState extends State<ScannerHomePage> {
   static const platform = MethodChannel('com.example.student_card_scanner/nfc');
 
+  // --- CONFIGURATION ---
+  final String _apiBase = "https://student-smart-card-backend.onrender.com/api";
+  final double _chargeAmount = 5.00;
+
   String _statusMessage = "Initializing...";
   String? _scannedToken;
   String? _scanMethod;
   bool _isScanning = false;
-  int _nfcHealth = -1;
+
+  // LOCK: Prevents freezing if user clicks multiple times
+  bool _isProcessing = false;
+
+  int _nfcHealth = -1; // 0 = Ready, 1 = Disabled, 2 = Missing
+
+  // Transaction Data
+  String? _studentName;
+  String? _transactionResult;
+  double? _newBalance;
 
   @override
   void initState() {
@@ -46,16 +62,18 @@ class _ScannerHomePageState extends State<ScannerHomePage> {
     _checkSystemHealth();
   }
 
-  // --- LOGIC SECTION ---
-
   Future<void> _checkSystemHealth() async {
     try {
       final int result = await platform.invokeMethod('checkNfcStatus');
       setState(() {
         _nfcHealth = result;
-        _statusMessage = (result == 0)
-            ? "System Ready"
-            : (result == 1 ? "NFC is Disabled" : "No NFC Hardware Detected");
+        if (result == 0) {
+          _statusMessage = "System Ready";
+        } else if (result == 1) {
+          _statusMessage = "NFC is Disabled";
+        } else {
+          _statusMessage = "No NFC Hardware";
+        }
       });
     } on PlatformException catch (e) {
       setState(() {
@@ -65,17 +83,116 @@ class _ScannerHomePageState extends State<ScannerHomePage> {
     }
   }
 
-  Future<void> _handleScanResult(String token, String method) async {
-    await HapticFeedback.heavyImpact();
+  // --- PAYMENT LOGIC ---
+  Future<void> _processTransaction(String token, String method) async {
+    if (_isProcessing) return;
+
     setState(() {
+      _isProcessing = true;
       _isScanning = false;
       _scannedToken = token;
       _scanMethod = method;
-      _statusMessage = "Access Granted";
+      _statusMessage = "Verifying Student...";
+      _transactionResult = null;
     });
+
+    try {
+      // 1. GET STUDENT INFO
+      final infoResponse = await http.get(Uri.parse("$_apiBase/student/$token"));
+
+      if (infoResponse.statusCode != 200) throw "Student Not Found";
+
+      final studentData = jsonDecode(infoResponse.body);
+      final String name = studentData['name'];
+      final double balance = studentData['walletBalance'];
+
+      // 2. CONFIRM DIALOG
+      bool confirm = await _showConfirmDialog(name, balance);
+      if (!confirm) {
+        _resetScan();
+        return;
+      }
+
+      setState(() => _statusMessage = "Processing Payment...");
+
+      // 3. CHARGE
+      final chargeResponse = await http.post(
+        Uri.parse("$_apiBase/payment/deduct"),
+        headers: {"Content-Type": "application/json"},
+        body: jsonEncode({"nfcToken": token, "amount": _chargeAmount}),
+      );
+
+      if (chargeResponse.statusCode == 200) {
+        await HapticFeedback.heavyImpact();
+
+        // 4. SAVE TO DB (Safe Call)
+        try {
+          await platform.invokeMethod('saveTransaction', {
+            "name": name,
+            "token": token,
+            "amount": _chargeAmount,
+            "status": "SUCCESS"
+          });
+        } catch (_) {}
+
+        setState(() {
+          _studentName = name;
+          _newBalance = balance - _chargeAmount;
+          _transactionResult = "APPROVED";
+          _statusMessage = "Transaction Complete";
+          _isProcessing = false;
+        });
+
+      } else {
+        throw "Payment Rejected";
+      }
+
+    } catch (e) {
+      await HapticFeedback.vibrate();
+      setState(() {
+        _transactionResult = "DECLINED";
+        _statusMessage = e.toString();
+        _isProcessing = false;
+      });
+    }
+  }
+
+  Future<bool> _showConfirmDialog(String name, double balance) async {
+    return await showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text("Confirm Charge"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.account_circle, size: 60, color: Colors.indigo),
+            const SizedBox(height: 10),
+            Text(name, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+            Text("Balance: \$${balance.toStringAsFixed(2)}"),
+            const Divider(height: 30),
+            Text("Charge: \$$_chargeAmount", style: const TextStyle(fontSize: 18, color: Colors.red)),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text("CANCEL"),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+            child: const Text("CHARGE"),
+          ),
+        ],
+      ),
+    ) ?? false;
   }
 
   Future<void> _startNfcScan() async {
+    if (_isProcessing) return;
+
+    // --- FIX: Prevent scan if hardware is bad ---
     if (_nfcHealth != 0) {
       await _checkSystemHealth();
       if (_nfcHealth != 0) return;
@@ -89,36 +206,37 @@ class _ScannerHomePageState extends State<ScannerHomePage> {
 
     try {
       final String token = await platform.invokeMethod('startScan');
-      _handleScanResult(token, "NFC");
-    } on PlatformException catch (e) {
-      await HapticFeedback.vibrate();
+      _processTransaction(token, "NFC");
+    } catch (e) {
       setState(() {
         _isScanning = false;
-        _statusMessage = "NFC Scan Failed: ${e.message}";
+        _statusMessage = "Scan Cancelled or Failed";
       });
     }
   }
 
   Future<void> _startQrScan() async {
+    if (_isProcessing) return;
+
     final String? result = await Navigator.push(
       context,
       MaterialPageRoute(builder: (context) => const ProfessionalQrScanner()),
     );
 
-    if (result != null) {
-      _handleScanResult(result, "QR");
-    }
+    if (result != null) _processTransaction(result, "QR");
   }
 
   void _resetScan() {
     setState(() {
+      _isProcessing = false;
       _scannedToken = null;
       _scanMethod = null;
+      _transactionResult = null;
       _statusMessage = "System Ready";
     });
   }
 
-  // --- UI BUILDER SECTION ---
+  // --- UI BUILDER ---
 
   @override
   Widget build(BuildContext context) {
@@ -138,12 +256,15 @@ class _ScannerHomePageState extends State<ScannerHomePage> {
             children: [
               _buildStatusHeader(),
               const Spacer(),
-              AnimatedSwitcher(
-                duration: const Duration(milliseconds: 300),
-                child: _scannedToken != null
-                    ? _buildResultCard()
-                    : _buildScanningVisual(),
-              ),
+              if (_isProcessing && _transactionResult == null)
+                const Center(child: CircularProgressIndicator())
+              else
+                AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 300),
+                  child: _scannedToken != null
+                      ? _buildResultCard()
+                      : _buildScanningVisual(),
+                ),
               const Spacer(),
               _buildActionButtons(),
             ],
@@ -205,37 +326,42 @@ class _ScannerHomePageState extends State<ScannerHomePage> {
   }
 
   Widget _buildResultCard() {
+    bool isSuccess = _transactionResult == "APPROVED";
+
     return Container(
       key: const ValueKey('result'),
       padding: const EdgeInsets.all(30),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(20),
-        boxShadow: [BoxShadow(color: Colors.green.withOpacity(0.2), blurRadius: 30)],
-        border: Border.all(color: Colors.green.withOpacity(0.5)),
+        boxShadow: [BoxShadow(color: isSuccess ? Colors.green.withOpacity(0.2) : Colors.red.withOpacity(0.2), blurRadius: 30)],
+        border: Border.all(color: isSuccess ? Colors.green.withOpacity(0.5) : Colors.red.withOpacity(0.5)),
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const CircleAvatar(
-            radius: 40, backgroundColor: Colors.green,
-            child: Icon(Icons.check, color: Colors.white, size: 50),
+          CircleAvatar(
+            radius: 40,
+            backgroundColor: isSuccess ? Colors.green : Colors.red,
+            child: Icon(isSuccess ? Icons.check : Icons.close, color: Colors.white, size: 50),
           ),
           const SizedBox(height: 20),
           Text(
-            "VALID STUDENT ID",
-            style: TextStyle(color: Colors.green[800], fontWeight: FontWeight.bold, fontSize: 16),
-          ),
-          const Divider(height: 40),
-          Text(
-            _scannedToken ?? "",
-            textAlign: TextAlign.center,
-            style: const TextStyle(fontFamily: 'Courier', fontSize: 20, fontWeight: FontWeight.bold),
+            isSuccess ? "PAYMENT SUCCESSFUL" : "PAYMENT FAILED",
+            style: TextStyle(color: isSuccess ? Colors.green[800] : Colors.red[800], fontWeight: FontWeight.bold, fontSize: 16),
           ),
           const SizedBox(height: 10),
+          if (isSuccess) ...[
+            Text(_studentName ?? "", style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+            Text("New Balance: \$${_newBalance?.toStringAsFixed(2)}", style: TextStyle(fontSize: 16, color: Colors.grey[600])),
+          ] else ...[
+            Text(_statusMessage, textAlign: TextAlign.center, style: TextStyle(fontSize: 14, color: Colors.grey[600])),
+          ],
+          const Divider(height: 40),
           Text(
-            "Verified via $_scanMethod",
-            style: TextStyle(fontSize: 12, color: Colors.grey[400]),
+            "ID: $_scannedToken",
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontFamily: 'Courier', fontSize: 12, fontWeight: FontWeight.bold, color: Colors.grey),
           ),
         ],
       ),
@@ -258,9 +384,11 @@ class _ScannerHomePageState extends State<ScannerHomePage> {
 
     return Column(
       children: [
+        // --- FIX: BUTTON DISABLE LOGIC RESTORED ---
         SizedBox(
           width: double.infinity,
           child: ElevatedButton(
+            // Only enabled if NOT scanning AND NFC health is good (0)
             onPressed: (_isScanning || _nfcHealth != 0) ? null : _startNfcScan,
             style: ElevatedButton.styleFrom(
               padding: const EdgeInsets.symmetric(vertical: 18),
@@ -294,7 +422,7 @@ class _ScannerHomePageState extends State<ScannerHomePage> {
 }
 
 // =======================================================
-//   PROFESSIONAL QR SCANNER (Filtered + Reliable)
+//   PROFESSIONAL QR SCANNER (RESTORED)
 // =======================================================
 
 class ProfessionalQrScanner extends StatefulWidget {
@@ -319,15 +447,8 @@ class _ProfessionalQrScannerState extends State<ProfessionalQrScanner> with Tick
     WidgetsBinding.instance.addObserver(this);
     controller.start();
 
-    // Setup Laser Line Animation
-    _lineController = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 2),
-    );
-    _lineAnimation = Tween<double>(begin: 0, end: 1).animate(CurvedAnimation(
-      parent: _lineController,
-      curve: Curves.easeInOut,
-    ));
+    _lineController = AnimationController(vsync: this, duration: const Duration(seconds: 2));
+    _lineAnimation = Tween<double>(begin: 0, end: 1).animate(CurvedAnimation(parent: _lineController, curve: Curves.easeInOut));
     _lineController.repeat(reverse: true);
   }
 
@@ -364,7 +485,6 @@ class _ProfessionalQrScannerState extends State<ProfessionalQrScanner> with Tick
       backgroundColor: Colors.black,
       body: LayoutBuilder(
         builder: (context, constraints) {
-          // 1. Calculate the exact "Visual" rectangle
           final double scanSize = 280;
           final Rect scanWindow = Rect.fromCenter(
             center: Offset(constraints.maxWidth / 2, constraints.maxHeight / 2),
@@ -374,63 +494,42 @@ class _ProfessionalQrScannerState extends State<ProfessionalQrScanner> with Tick
 
           return Stack(
             children: [
-              // 2. Camera Layer (Full Screen for Reliability)
               MobileScanner(
                 controller: controller,
-                // NO 'scanWindow' passed here to ensure scanning works on all phones
-                errorBuilder: (context, error, /* no child */) {
+                errorBuilder: (context, error) {
                   return Center(
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         const Icon(Icons.error, color: Colors.red, size: 50),
                         const SizedBox(height: 10),
-                        Text(
-                          "Camera Error: ${error.errorCode}",
-                          style: const TextStyle(color: Colors.white),
-                        ),
+                        Text("Camera Error: ${error.errorCode}", style: const TextStyle(color: Colors.white)),
                       ],
                     ),
                   );
                 },
                 onDetect: (capture) async {
-                  if (_isLockedOn) return; // Prevent multiple scans
+                  if (_isLockedOn) return;
 
                   final List<Barcode> barcodes = capture.barcodes;
                   for (final barcode in barcodes) {
                     final String? rawValue = barcode.rawValue;
-
-                    // --- SECURITY CHECK ---
-                    // Only accept codes that look like our Student Token
                     if (rawValue != null && rawValue.startsWith("STUDENT-ID")) {
-
-                      setState(() {
-                        _isLockedOn = true; // Lock the UI
-                      });
-
-                      // Haptic Feedback
+                      setState(() => _isLockedOn = true);
                       await HapticFeedback.selectionClick();
-
-                      // Wait 3 Seconds (Simulate Verification)
-                      await Future.delayed(const Duration(seconds: 3));
-
+                      await Future.delayed(const Duration(seconds: 2)); // Animation delay
                       if (!mounted) return;
-
-                      // Finish
                       controller.stop();
                       Navigator.pop(context, rawValue);
                       break;
                     }
-                    // Else: Do nothing. Ignore the random QR code.
                   }
                 },
               ),
 
-              // 3. Dark Overlay & Borders (Visual Only - Guides the User)
               CustomPaint(
                 painter: ScannerOverlayPainter(
                   scanWindow: scanWindow,
-                  // Color changes to Amber when processing
                   borderColor: _isLockedOn ? Colors.amber : const Color(0xFF00FF88),
                   borderRadius: 12,
                   borderLength: 30,
@@ -439,7 +538,6 @@ class _ProfessionalQrScannerState extends State<ProfessionalQrScanner> with Tick
                 child: Container(),
               ),
 
-              // 4. Animated Laser Line (Only when NOT locked)
               if (!_isLockedOn)
                 Positioned.fromRect(
                   rect: scanWindow,
@@ -450,19 +548,12 @@ class _ProfessionalQrScannerState extends State<ProfessionalQrScanner> with Tick
                         children: [
                           Positioned(
                             top: scanWindow.height * _lineAnimation.value,
-                            left: 0,
-                            right: 0,
+                            left: 0, right: 0,
                             child: Container(
                               height: 2,
                               decoration: BoxDecoration(
                                 color: const Color(0xFF00FF88),
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: const Color(0xFF00FF88).withOpacity(0.5),
-                                    blurRadius: 10,
-                                    spreadRadius: 2,
-                                  )
-                                ],
+                                boxShadow: [BoxShadow(color: const Color(0xFF00FF88).withOpacity(0.5), blurRadius: 10, spreadRadius: 2)],
                               ),
                             ),
                           ),
@@ -472,22 +563,12 @@ class _ProfessionalQrScannerState extends State<ProfessionalQrScanner> with Tick
                   ),
                 ),
 
-              // 5. Spinner (Only WHEN locked)
               if (_isLockedOn)
                 Positioned.fromRect(
                   rect: scanWindow,
-                  child: const Center(
-                    child: SizedBox(
-                      width: 60, height: 60,
-                      child: CircularProgressIndicator(
-                        color: Colors.amber,
-                        strokeWidth: 5,
-                      ),
-                    ),
-                  ),
+                  child: const Center(child: SizedBox(width: 60, height: 60, child: CircularProgressIndicator(color: Colors.amber, strokeWidth: 5))),
                 ),
 
-              // 6. Top Bar (Close Button)
               SafeArea(
                 child: Padding(
                   padding: const EdgeInsets.all(16.0),
@@ -495,16 +576,12 @@ class _ProfessionalQrScannerState extends State<ProfessionalQrScanner> with Tick
                     alignment: Alignment.topLeft,
                     child: CircleAvatar(
                       backgroundColor: Colors.black54,
-                      child: IconButton(
-                        icon: const Icon(Icons.close, color: Colors.white),
-                        onPressed: () => Navigator.pop(context),
-                      ),
+                      child: IconButton(icon: const Icon(Icons.close, color: Colors.white), onPressed: () => Navigator.pop(context)),
                     ),
                   ),
                 ),
               ),
 
-              // 7. Bottom Controls
               SafeArea(
                 child: Align(
                   alignment: Alignment.bottomCenter,
@@ -521,16 +598,10 @@ class _ProfessionalQrScannerState extends State<ProfessionalQrScanner> with Tick
                           ),
                           child: Text(
                             _isLockedOn ? "Verifying Security Token..." : "Align QR code within the frame",
-                            style: TextStyle(
-                                color: _isLockedOn ? Colors.black : Colors.white,
-                                fontSize: 14,
-                                fontWeight: FontWeight.bold
-                            ),
+                            style: TextStyle(color: _isLockedOn ? Colors.black : Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
                           ),
                         ),
                         const SizedBox(height: 30),
-
-                        // Flash Button (Hide when locked)
                         if (!_isLockedOn)
                           ValueListenableBuilder(
                             valueListenable: controller,
@@ -539,18 +610,13 @@ class _ProfessionalQrScannerState extends State<ProfessionalQrScanner> with Tick
                               return GestureDetector(
                                 onTap: () => controller.toggleTorch(),
                                 child: Container(
-                                  width: 60,
-                                  height: 60,
+                                  width: 60, height: 60,
                                   decoration: BoxDecoration(
                                     color: isFlashOn ? Colors.white : Colors.black54,
                                     shape: BoxShape.circle,
                                     border: Border.all(color: Colors.white, width: 2),
                                   ),
-                                  child: Icon(
-                                    isFlashOn ? Icons.flash_on : Icons.flash_off,
-                                    color: isFlashOn ? Colors.black : Colors.white,
-                                    size: 30,
-                                  ),
+                                  child: Icon(isFlashOn ? Icons.flash_on : Icons.flash_off, color: isFlashOn ? Colors.black : Colors.white, size: 30),
                                 ),
                               );
                             },
@@ -576,87 +642,26 @@ class ScannerOverlayPainter extends CustomPainter {
   final double borderLength;
   final double borderWidth;
 
-  ScannerOverlayPainter({
-    required this.scanWindow,
-    required this.borderColor,
-    required this.borderRadius,
-    required this.borderLength,
-    required this.borderWidth,
-  });
+  ScannerOverlayPainter({required this.scanWindow, required this.borderColor, required this.borderRadius, required this.borderLength, required this.borderWidth});
 
   @override
   void paint(Canvas canvas, Size size) {
-    // 1. Draw Semi-Transparent Background Overlay
     final Paint overlayPaint = Paint()..color = Colors.black.withOpacity(0.6);
-
-    // Create a path for the whole screen
     Path backgroundPath = Path()..addRect(Rect.fromLTWH(0, 0, size.width, size.height));
-
-    // Create a path for the cutout (based on scanWindow)
-    Path cutoutPath = Path()
-      ..addRRect(
-        RRect.fromRectAndRadius(
-          scanWindow,
-          Radius.circular(borderRadius),
-        ),
-      );
-
-    // Subtract cutout from background
-    final Path finalOverlayPath = Path.combine(
-      PathOperation.difference,
-      backgroundPath,
-      cutoutPath,
-    );
-
+    Path cutoutPath = Path()..addRRect(RRect.fromRectAndRadius(scanWindow, Radius.circular(borderRadius)));
+    final Path finalOverlayPath = Path.combine(PathOperation.difference, backgroundPath, cutoutPath);
     canvas.drawPath(finalOverlayPath, overlayPaint);
 
-    // 2. Draw Corner Borders (Based on scanWindow coordinates)
-    final Paint borderPaint = Paint()
-      ..color = borderColor
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = borderWidth
-      ..strokeCap = StrokeCap.round;
-
+    final Paint borderPaint = Paint()..color = borderColor..style = PaintingStyle.stroke..strokeWidth = borderWidth..strokeCap = StrokeCap.round;
     final double left = scanWindow.left;
     final double top = scanWindow.top;
     final double right = scanWindow.right;
     final double bottom = scanWindow.bottom;
 
-    // Top Left
-    canvas.drawPath(
-      Path()
-        ..moveTo(left, top + borderLength)
-        ..lineTo(left, top)
-        ..lineTo(left + borderLength, top),
-      borderPaint,
-    );
-
-    // Top Right
-    canvas.drawPath(
-      Path()
-        ..moveTo(right - borderLength, top)
-        ..lineTo(right, top)
-        ..lineTo(right, top + borderLength),
-      borderPaint,
-    );
-
-    // Bottom Right
-    canvas.drawPath(
-      Path()
-        ..moveTo(right, bottom - borderLength)
-        ..lineTo(right, bottom)
-        ..lineTo(right - borderLength, bottom),
-      borderPaint,
-    );
-
-    // Bottom Left
-    canvas.drawPath(
-      Path()
-        ..moveTo(left + borderLength, bottom)
-        ..lineTo(left, bottom)
-        ..lineTo(left, bottom - borderLength),
-      borderPaint,
-    );
+    canvas.drawPath(Path()..moveTo(left, top + borderLength)..lineTo(left, top)..lineTo(left + borderLength, top), borderPaint);
+    canvas.drawPath(Path()..moveTo(right - borderLength, top)..lineTo(right, top)..lineTo(right, top + borderLength), borderPaint);
+    canvas.drawPath(Path()..moveTo(right, bottom - borderLength)..lineTo(right, bottom)..lineTo(right - borderLength, bottom), borderPaint);
+    canvas.drawPath(Path()..moveTo(left + borderLength, bottom)..lineTo(left, bottom)..lineTo(left, bottom - borderLength), borderPaint);
   }
 
   @override

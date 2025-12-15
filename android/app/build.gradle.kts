@@ -1,8 +1,18 @@
+// 1. IMPORT PROPERTIES (Required to read the file)
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("kotlin-android")
-    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+}
+
+// 2. LOAD LOCAL.PROPERTIES
+// This block reads the file where you hid the secret key
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.exists()) {
+    localProperties.load(localPropertiesFile.inputStream())
 }
 
 android {
@@ -20,27 +30,33 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.example.student_card_scanner"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
-//        minSdk = flutter.minSdkVersion
         minSdk = 26
-
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // 3. INJECT THE SECRET
+        // This takes the key from local.properties and creates a Java variable "APP_CENTER_SECRET"
+        val appCenterSecret = localProperties.getProperty("app.center.secret")
+        if (appCenterSecret != null) {
+            buildConfigField("String", "APP_CENTER_SECRET", appCenterSecret)
+        }
+    }
+
+    buildFeatures {
+        // 4. ENABLE BUILD CONFIG
+        // This allows the app to generate the 'BuildConfig' class
+        buildConfig = true
     }
 
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
         }
     }
 }
-// 1. Tell Gradle to look inside the 'libs' folder for dependencies
+
 repositories {
     flatDir {
         dirs("libs")
@@ -48,9 +64,17 @@ repositories {
 }
 
 dependencies {
-    // 2. Import the AAR by name (without the path)
-    implementation(mapOf("name" to "card-emulator-release", "ext" to "aar"))
+    val room_version = "2.6.1"
+    implementation("androidx.room:room-runtime:$room_version")
+
+    // Ensure the filename in 'libs' matches this exactly (e.g., card-emulator-debug.aar)
+    implementation(mapOf("name" to "card-emulator-debug", "ext" to "aar"))
+
+    val appCenterSdkVersion = "5.0.4"
+    implementation("com.microsoft.appcenter:appcenter-analytics:$appCenterSdkVersion")
+    implementation("com.microsoft.appcenter:appcenter-crashes:$appCenterSdkVersion")
 }
+
 flutter {
     source = "../.."
 }
