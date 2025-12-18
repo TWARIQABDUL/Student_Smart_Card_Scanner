@@ -17,17 +17,19 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
   final ScannerService _scannerService = ScannerService();
   final _storage = const FlutterSecureStorage();
 
-  // ⚠️ YOUR RENDER URL
+  // ⚠️ YOUR SERVER URL
   static const String baseUrl = 'https://student-smart-card-backend.onrender.com/api/v1';
 
   // --- UI STATE ---
-  String _status = "CHECKING HARDWARE...";
-  Color _statusColor = Colors.grey;
-  Color _bgColor = const Color(0xFF12141F);
+  String _mainStatusText = "Checking...";
+  String _subStatusText = "Initializing sensors";
 
-  bool _isProcessing = false;      // True = Show Loading Spinner
-  bool _showResult = false;        // True = Show Big Check/X (Success/Fail)
-  IconData _resultIcon = Icons.check_circle; // The icon to show for result
+  Color _bgColor = const Color(0xFF1E202C);
+  Color _accentColor = Colors.cyanAccent;
+
+  bool _isProcessing = false;
+  bool _showResult = false;
+  IconData _centerIcon = Icons.wifi_tethering;
 
   int _nfcHardwareStatus = -1;
 
@@ -50,45 +52,63 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
     if (state == AppLifecycleState.resumed) _checkHardware();
   }
 
+  // --- THE REAL HARDWARE CHECK ---
   void _checkHardware() async {
+    // 1. Reset UI to neutral state while checking
+    setState(() {
+      _bgColor = const Color(0xFF1E202C);
+      _showResult = false; // Hide the Green/Red screen
+      _isProcessing = false;
+    });
+
+    // 2. Ask Native Code
     int status = await _scannerService.checkNfcStatus();
+
+    // 3. Update UI based on reality
     setState(() {
       _nfcHardwareStatus = status;
       if (status == 0) {
-        _status = "READY TO SCAN";
-        _statusColor = Colors.white;
+        _resetUI("READY TO SCAN", "Tap NFC or Scan QR", Colors.cyanAccent, Icons.wifi_tethering);
       } else {
-        _status = "NFC UNAVAILABLE\nUse QR Scan";
-        _statusColor = Colors.orangeAccent;
+        _resetUI("NFC OFF", "Use QR Code Scanner", Colors.orangeAccent, Icons.qr_code);
       }
     });
   }
 
+  void _resetUI(String main, String sub, Color color, IconData icon) {
+    setState(() {
+      _mainStatusText = main;
+      _subStatusText = sub;
+      _accentColor = color;
+      _centerIcon = icon;
+      _bgColor = const Color(0xFF1E202C);
+      _isProcessing = false;
+      _showResult = false;
+    });
+  }
+
   // =========================================================
-  // 1. TRIGGER: NFC
+  // LOGIC
   // =========================================================
+
   void _startNfcScan() async {
     if (_nfcHardwareStatus != 0) return;
 
     setState(() {
       _isProcessing = true;
-      _showResult = false; // Hide previous result
-      _status = "HOLD CARD NEAR PHONE...";
-      _statusColor = Colors.cyanAccent;
-      _bgColor = const Color(0xFF12141F);
+      _mainStatusText = "Reading Card...";
+      _subStatusText = "Hold steady";
+      _accentColor = Colors.cyanAccent;
     });
 
     try {
       String nfcToken = await _scannerService.startScan();
       _verifyTokenOnBackend(nfcToken);
     } catch (e) {
-      _showError("NFC Scan Failed");
+      _showError("Scan Failed");
     }
   }
 
-  // =========================================================
-  // 2. TRIGGER: QR CODE
-  // =========================================================
   void _startQrScan() async {
     final String? qrCode = await Navigator.push(
       context,
@@ -96,24 +116,16 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
     );
 
     if (qrCode != null) {
-      // Immediate feedback before backend call
-      setState(() {
-        _isProcessing = true;
-        _showResult = false;
-        _bgColor = const Color(0xFF12141F);
-      });
       _verifyTokenOnBackend(qrCode);
     }
   }
 
-  // =========================================================
-  // 3. COMMON BACKEND LOGIC (The Brain)
-  // =========================================================
   void _verifyTokenOnBackend(String token) async {
     setState(() {
       _isProcessing = true;
-      _status = "VERIFYING ID..."; // Updated text
-      _statusColor = Colors.cyanAccent;
+      _mainStatusText = "Verifying ID...";
+      _subStatusText = "Checking database";
+      _accentColor = Colors.blueAccent;
     });
 
     try {
@@ -130,33 +142,33 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
           'nfcToken': token,
           'gateId': "MAIN_ENTRANCE"
         }),
-      ).timeout(const Duration(seconds: 10)); // Added Timeout Safety
+      ).timeout(const Duration(seconds: 10));
 
       final body = jsonDecode(response.body);
 
       if (response.statusCode == 200) {
-        // ✅ ACCESS GRANTED
         setState(() {
           _isProcessing = false;
           _showResult = true;
-          _resultIcon = Icons.check_circle_outline; // Big Check
-          _status = "ACCESS GRANTED\n${body['studentName']}";
-          _statusColor = Colors.white;
+          _mainStatusText = "ACCESS GRANTED";
+          _subStatusText = body['studentName'] ?? "Student";
+          _centerIcon = Icons.check_circle;
+          _accentColor = Colors.white;
           _bgColor = Colors.green[700]!;
         });
       } else {
-        // ❌ ACCESS DENIED
         setState(() {
           _isProcessing = false;
           _showResult = true;
-          _resultIcon = Icons.cancel_outlined; // Big X
-          _status = "DENIED\n${body['error'] ?? 'Unknown Error'}";
-          _statusColor = Colors.white;
+          _mainStatusText = "ACCESS DENIED";
+          _subStatusText = body['error'] ?? "Unknown Error";
+          _centerIcon = Icons.cancel;
+          _accentColor = Colors.white;
           _bgColor = Colors.red[800]!;
         });
       }
     } catch (e) {
-      _showError("Connection Error: $e");
+      _showError("Connection Error");
     }
   }
 
@@ -164,10 +176,11 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
     setState(() {
       _isProcessing = false;
       _showResult = true;
-      _resultIcon = Icons.error_outline;
-      _status = message;
-      _statusColor = Colors.orange;
-      _bgColor = const Color(0xFF12141F);
+      _mainStatusText = "ERROR";
+      _subStatusText = message;
+      _centerIcon = Icons.warning_amber_rounded;
+      _accentColor = Colors.white;
+      _bgColor = Colors.orange[800]!;
     });
   }
 
@@ -177,99 +190,168 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: _bgColor,
-      appBar: AppBar(
-        title: Text("Main Gate", style: GoogleFonts.poppins(fontWeight: FontWeight.bold)),
-        backgroundColor: Colors.transparent,
-        centerTitle: true,
-        elevation: 0,
-        actions: [
-          IconButton(icon: const Icon(Icons.exit_to_app), onPressed: () => Navigator.pop(context))
-        ],
-      ),
-      // 1. Force Body to take Full Width/Height for centering
-      body: SizedBox(
+      body: AnimatedContainer(
+        duration: const Duration(milliseconds: 500),
+        curve: Curves.easeInOut,
+        color: _bgColor,
         width: double.infinity,
         height: double.infinity,
-        child: Padding(
-          padding: const EdgeInsets.all(30),
+        child: SafeArea(
           child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            crossAxisAlignment: CrossAxisAlignment.center, // 2. Horizontal Center
             children: [
-
-              // --- 1. THE STATUS INDICATOR ---
-              // Case A: Loading (Spinner)
-              if (_isProcessing)
-                const SizedBox(
-                  height: 100,
-                  width: 100,
-                  child: CircularProgressIndicator(
-                    color: Colors.cyanAccent,
-                    strokeWidth: 8,
-                  ),
-                )
-              // Case B: Result (Check/X)
-              else if (_showResult)
-                Icon(_resultIcon, size: 120, color: _statusColor)
-              // Case C: Idle (NFC/QR Icon)
-              else
-                Icon(
-                    _nfcHardwareStatus == 0 ? Icons.nfc : Icons.qr_code,
-                    size: 100,
-                    color: _statusColor
+              // 1. TOP BAR
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text("GUARD TERMINAL", style: GoogleFonts.poppins(color: Colors.white54, fontSize: 12, letterSpacing: 1.5)),
+                        Text("Main Entrance", style: GoogleFonts.poppins(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+                      ],
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.power_settings_new, color: Colors.white54),
+                      onPressed: () => Navigator.pop(context),
+                    )
+                  ],
                 ),
-
-              const SizedBox(height: 30),
-
-              // --- 2. STATUS TEXT ---
-              Text(
-                _status,
-                textAlign: TextAlign.center,
-                style: GoogleFonts.poppins(color: _statusColor, fontSize: 24, fontWeight: FontWeight.bold),
               ),
 
-              const SizedBox(height: 60),
+              const Spacer(),
 
-              // --- 3. BUTTONS (Only show when NOT processing) ---
-              if (!_isProcessing) ...[
-                // OPTION A: NFC
-                if (_nfcHardwareStatus == 0)
-                  SizedBox(
-                    width: double.infinity,
-                    height: 60,
-                    child: ElevatedButton.icon(
-                      onPressed: _startNfcScan,
-                      icon: const Icon(Icons.wifi_tethering),
-                      label: Text("SCAN NFC", style: GoogleFonts.poppins(fontSize: 18, fontWeight: FontWeight.bold)),
-                      style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.white,
-                          foregroundColor: Colors.black,
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
-                      ),
+              // 2. CENTER SCANNER RING
+              Stack(
+                alignment: Alignment.center,
+                children: [
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 300),
+                    height: 280,
+                    width: 280,
+                    decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                            color: _accentColor.withValues(alpha: 0.3),
+                            width: 2
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                              color: _accentColor.withValues(alpha: 0.2),
+                              blurRadius: 40,
+                              spreadRadius: 5
+                          )
+                        ]
                     ),
                   ),
 
-                if (_nfcHardwareStatus == 0) const SizedBox(height: 20),
-
-                // OPTION B: QR
-                SizedBox(
-                  width: double.infinity,
-                  height: 60,
-                  child: ElevatedButton.icon(
-                    onPressed: _startQrScan,
-                    icon: const Icon(Icons.qr_code_scanner),
-                    label: Text("SCAN QR CODE", style: GoogleFonts.poppins(fontSize: 18, fontWeight: FontWeight.bold)),
-                    style: ElevatedButton.styleFrom(
-                        backgroundColor: _nfcHardwareStatus == 0 ? Colors.white10 : Colors.white,
-                        foregroundColor: _nfcHardwareStatus == 0 ? Colors.white : Colors.black,
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
+                  Container(
+                    height: 220,
+                    width: 220,
+                    decoration: BoxDecoration(
+                      color: Colors.black26,
+                      shape: BoxShape.circle,
+                      border: Border.all(color: _accentColor, width: 4),
                     ),
+                    child: Center(
+                      child: _isProcessing
+                          ? CircularProgressIndicator(color: _accentColor, strokeWidth: 5)
+                          : Icon(_centerIcon, size: 80, color: _accentColor),
+                    ),
+                  ),
+                ],
+              ),
+
+              const SizedBox(height: 40),
+
+              // 3. STATUS TEXT
+              Text(
+                _mainStatusText.toUpperCase(),
+                style: GoogleFonts.poppins(
+                    color: Colors.white,
+                    fontSize: 28,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 1.2
+                ),
+              ),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                    color: Colors.black26,
+                    borderRadius: BorderRadius.circular(20)
+                ),
+                child: Text(
+                  _subStatusText,
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.poppins(color: Colors.white70, fontSize: 16),
+                ),
+              ),
+
+              const Spacer(),
+
+              // 4. BOTTOM CONTROLS (Only visible if not verifying)
+              if (!_isProcessing && !_showResult)
+                Padding(
+                  padding: const EdgeInsets.all(30),
+                  child: Column(
+                    children: [
+                      if (_nfcHardwareStatus == 0)
+                        _buildActionButton(
+                            "SCAN NFC CARD",
+                            Icons.wifi_tethering,
+                            Colors.cyanAccent,
+                            Colors.black,
+                            _startNfcScan
+                        ),
+
+                      const SizedBox(height: 15),
+
+                      _buildActionButton(
+                          "SCAN QR CODE",
+                          Icons.qr_code_scanner,
+                          Colors.transparent,
+                          Colors.white,
+                          _startQrScan,
+                          isOutlined: true
+                      ),
+                    ],
                   ),
                 ),
-              ]
+
+              // 5. RESET BUTTON (Fix applied here!)
+              if (_showResult)
+                Padding(
+                  padding: const EdgeInsets.all(30),
+                  child: _buildActionButton(
+                      "SCAN NEXT",
+                      Icons.refresh,
+                      Colors.white,
+                      Colors.black,
+                      _checkHardware // <--- THE FIX: Re-run hardware check, don't just reset text
+                  ),
+                ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildActionButton(String label, IconData icon, Color bg, Color text, VoidCallback onTap, {bool isOutlined = false}) {
+    return SizedBox(
+      width: double.infinity,
+      height: 60,
+      child: ElevatedButton.icon(
+        onPressed: onTap,
+        icon: Icon(icon, color: text),
+        label: Text(label, style: GoogleFonts.poppins(fontSize: 16, fontWeight: FontWeight.bold, color: text)),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: bg,
+          elevation: isOutlined ? 0 : 5,
+          side: isOutlined ? const BorderSide(color: Colors.white24, width: 2) : BorderSide.none,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         ),
       ),
     );
