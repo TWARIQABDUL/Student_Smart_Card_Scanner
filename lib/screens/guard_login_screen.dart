@@ -1,7 +1,10 @@
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:provider/provider.dart'; // 👈 IMPORT PROVIDER
 import '../services/auth_service.dart';
+import '../services/theme_manager.dart'; // 👈 IMPORT THEME MANAGER
+import '../models/user_model.dart';      // 👈 IMPORT USER MODEL
 import 'scanner_dashboard.dart';
 
 class GuardLoginScreen extends StatefulWidget {
@@ -17,10 +20,10 @@ class _GuardLoginScreenState extends State<GuardLoginScreen> {
   final TextEditingController _passController = TextEditingController();
 
   bool _isLoading = false;
-  bool _obscurePassword = true; // State for password visibility
+  bool _obscurePassword = true;
 
   void _login() async {
-    // 1. VALIDATION: Check for empty fields first
+    // 1. VALIDATION
     if (_emailController.text.trim().isEmpty || _passController.text.trim().isEmpty) {
       _showErrorDialog("Input Error", "Please enter both Guard ID and Password.");
       return;
@@ -28,36 +31,44 @@ class _GuardLoginScreenState extends State<GuardLoginScreen> {
 
     setState(() => _isLoading = true);
 
-    // 2. Call API
+    // 2. Call API (AuthService)
     final result = await _authService.login(
         _emailController.text.trim(),
         _passController.text.trim()
     );
 
     if (!mounted) return;
-
     setState(() => _isLoading = false);
 
     // 3. Handle Result
     if (result is Map && result.containsKey('token')) {
-      final user = result['user'];
-      final String role = user != null ? (user['role'] ?? 'UNKNOWN') : 'UNKNOWN';
+      try {
+        // 🚀 A. Parse User to get Colors
+        final user = User.fromJson(result['user']);
 
-      if (role == 'GUARD' || role == 'ADMIN') {
-        Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(builder: (context) => const ScannerDashboard())
-        );
-      } else {
-        _showErrorDialog(
-            "Security Alert",
-            "Access Denied.\n\nYou are logged in as a STUDENT, but this app is for GUARDS only."
-        );
+        // 🚀 B. Check Role
+        if (user.role == 'GUARD' || user.role == 'ADMIN') {
+
+          // 🎨 C. ACTIVATE CHAMELEON MODE!
+          // This saves the Red/Blue colors to storage so the Dashboard can use them.
+          await Provider.of<ThemeManager>(context, listen: false).updateTheme(user);
+
+          // 🚀 D. Navigate
+          Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(builder: (context) => const ScannerDashboard())
+          );
+        } else {
+          _showErrorDialog("Access Denied", "Guards Only.");
+        }
+      } catch (e) {
+        _showErrorDialog("Data Error", "Could not load user profile: $e");
       }
     } else {
+      // Show Error
       ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(result is Map ? result['error'] ?? "Login Failed" : result.toString()),
+            content: Text(result is Map ? result['error'] ?? "Login Failed" : "Login Failed"),
             backgroundColor: Colors.redAccent,
             behavior: SnackBarBehavior.floating,
           )
@@ -91,6 +102,7 @@ class _GuardLoginScreenState extends State<GuardLoginScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Keep the Login Screen Dark/Neutral (Before we know the University)
     return Scaffold(
       body: Container(
         width: double.infinity,
@@ -178,7 +190,7 @@ class _GuardLoginScreenState extends State<GuardLoginScreen> {
 
                               const SizedBox(height: 16),
 
-                              // Password Input (With Toggle)
+                              // Password Input
                               _buildTextField(
                                   controller: _passController,
                                   label: "Password",
@@ -228,7 +240,6 @@ class _GuardLoginScreenState extends State<GuardLoginScreen> {
     );
   }
 
-  // --- UPDATED TEXT FIELD BUILDER ---
   Widget _buildTextField({
     required TextEditingController controller,
     required String label,
@@ -248,12 +259,11 @@ class _GuardLoginScreenState extends State<GuardLoginScreen> {
           ),
           child: TextField(
             controller: controller,
-            obscureText: isPassword ? _obscurePassword : false, // Logic for hiding text
+            obscureText: isPassword ? _obscurePassword : false,
             style: GoogleFonts.poppins(color: Colors.white),
             cursorColor: Colors.cyanAccent,
             decoration: InputDecoration(
               prefixIcon: Icon(icon, color: Colors.white54),
-              // Add Suffix Icon ONLY for passwords
               suffixIcon: isPassword
                   ? IconButton(
                 icon: Icon(

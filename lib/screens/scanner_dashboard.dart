@@ -3,8 +3,11 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:provider/provider.dart'; // 👈 Import Provider
 import '../services/scanner_service.dart';
+import '../services/theme_manager.dart'; // 👈 Import Theme Manager
 import 'qr_scanner_screen.dart';
+import 'guard_login_screen.dart'; // For Logout
 
 class ScannerDashboard extends StatefulWidget {
   const ScannerDashboard({super.key});
@@ -24,8 +27,9 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
   String _mainStatusText = "Checking...";
   String _subStatusText = "Initializing sensors";
 
-  Color _bgColor = const Color(0xFF1E202C);
-  Color _accentColor = Colors.cyanAccent;
+  // ✅ STATUS OVERRIDES (Null means "Use Campus Theme")
+  Color? _statusBgColor;
+  Color? _statusAccentColor;
 
   bool _isProcessing = false;
   bool _showResult = false;
@@ -52,36 +56,35 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
     if (state == AppLifecycleState.resumed) _checkHardware();
   }
 
-  // --- THE REAL HARDWARE CHECK ---
+  // --- HARDWARE CHECK ---
   void _checkHardware() async {
-    // 1. Reset UI to neutral state while checking
     setState(() {
-      _bgColor = const Color(0xFF1E202C);
-      _showResult = false; // Hide the Green/Red screen
+      _statusBgColor = null; // 👈 Reset to Campus Theme
+      _showResult = false;
       _isProcessing = false;
     });
 
-    // 2. Ask Native Code
     int status = await _scannerService.checkNfcStatus();
 
-    // 3. Update UI based on reality
+    if (!mounted) return;
+
     setState(() {
       _nfcHardwareStatus = status;
       if (status == 0) {
-        _resetUI("READY TO SCAN", "Tap NFC or Scan QR", Colors.cyanAccent, Icons.wifi_tethering);
+        _resetUI("READY TO SCAN", "Tap NFC or Scan QR", Icons.wifi_tethering);
       } else {
-        _resetUI("NFC OFF", "Use QR Code Scanner", Colors.orangeAccent, Icons.qr_code);
+        _resetUI("NFC OFF", "Use QR Code Scanner", Icons.qr_code);
       }
     });
   }
 
-  void _resetUI(String main, String sub, Color color, IconData icon) {
+  void _resetUI(String main, String sub, IconData icon) {
     setState(() {
       _mainStatusText = main;
       _subStatusText = sub;
-      _accentColor = color;
       _centerIcon = icon;
-      _bgColor = const Color(0xFF1E202C);
+      _statusBgColor = null; // 👈 Reset to Campus Theme
+      _statusAccentColor = null;
       _isProcessing = false;
       _showResult = false;
     });
@@ -98,7 +101,6 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
       _isProcessing = true;
       _mainStatusText = "Reading Card...";
       _subStatusText = "Hold steady";
-      _accentColor = Colors.cyanAccent;
     });
 
     try {
@@ -125,7 +127,6 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
       _isProcessing = true;
       _mainStatusText = "Verifying ID...";
       _subStatusText = "Checking database";
-      _accentColor = Colors.blueAccent;
     });
 
     try {
@@ -145,26 +146,51 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
       ).timeout(const Duration(seconds: 10));
 
       final body = jsonDecode(response.body);
+      print("Response Body: $body");
 
+      // 🚀 LOGIC FIX: Check HTTP Status AND the 'status' field in JSON
       if (response.statusCode == 200) {
-        setState(() {
-          _isProcessing = false;
-          _showResult = true;
-          _mainStatusText = "ACCESS GRANTED";
-          _subStatusText = body['studentName'] ?? "Student";
-          _centerIcon = Icons.check_circle;
-          _accentColor = Colors.white;
-          _bgColor = Colors.green[700]!;
-        });
+
+        if (body['status'] == 'ALLOWED') {
+          // --- CASE 1: ALLOWED ---
+          setState(() {
+            _isProcessing = false;
+            _showResult = true;
+            _mainStatusText = "ACCESS GRANTED";
+            _subStatusText = body['studentName'] ?? "Student";
+            _centerIcon = Icons.check_circle;
+
+            // 🟢 Green Flash
+            _statusBgColor = Colors.green[700];
+            _statusAccentColor = Colors.white;
+          });
+        } else {
+          // --- CASE 2: DENIED (Backend logic) ---
+          setState(() {
+            _isProcessing = false;
+            _showResult = true;
+            _mainStatusText = "ACCESS DENIED";
+            _subStatusText = body['message'] ?? "Restricted Access";
+            _centerIcon = Icons.cancel;
+
+            // 🔴 Red Flash
+            _statusBgColor = Colors.red[800];
+            _statusAccentColor = Colors.white;
+          });
+        }
+
       } else {
+        // --- CASE 3: SERVER ERROR ---
         setState(() {
           _isProcessing = false;
           _showResult = true;
-          _mainStatusText = "ACCESS DENIED";
-          _subStatusText = body['error'] ?? "Unknown Error";
-          _centerIcon = Icons.cancel;
-          _accentColor = Colors.white;
-          _bgColor = Colors.red[800]!;
+          _mainStatusText = "SYSTEM ERROR";
+          _subStatusText = body['error'] ?? "Code: ${response.statusCode}";
+          _centerIcon = Icons.error_outline;
+
+          // 🟠 Orange Flash
+          _statusBgColor = Colors.orange[800];
+          _statusAccentColor = Colors.white;
         });
       }
     } catch (e) {
@@ -179,8 +205,9 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
       _mainStatusText = "ERROR";
       _subStatusText = message;
       _centerIcon = Icons.warning_amber_rounded;
-      _accentColor = Colors.white;
-      _bgColor = Colors.orange[800]!;
+
+      _statusBgColor = Colors.orange[800];
+      _statusAccentColor = Colors.white;
     });
   }
 
@@ -189,11 +216,20 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
   // =========================================================
   @override
   Widget build(BuildContext context) {
+    // 🎨 1. LISTEN TO THEME
+    final theme = Provider.of<ThemeManager>(context);
+
+    // 🎨 2. DETERMINE ACTIVE COLORS
+    // If we have a result (Green/Red), use it.
+    // Otherwise, use the SaaS Campus Colors.
+    final currentBg = _statusBgColor ?? theme.backgroundColor;
+    final currentAccent = _statusAccentColor ?? theme.primaryColor;
+
     return Scaffold(
       body: AnimatedContainer(
         duration: const Duration(milliseconds: 500),
         curve: Curves.easeInOut,
-        color: _bgColor,
+        color: currentBg, // 👈 Dynamic Background
         width: double.infinity,
         height: double.infinity,
         child: SafeArea(
@@ -213,8 +249,16 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
                       ],
                     ),
                     IconButton(
-                      icon: const Icon(Icons.power_settings_new, color: Colors.white54),
-                      onPressed: () => Navigator.pop(context),
+                      icon: const Icon(Icons.logout, color: Colors.white54),
+                      onPressed: () {
+                        // 🚪 LOGOUT
+                        Provider.of<ThemeManager>(context, listen: false).resetTheme();
+                        Navigator.pushAndRemoveUntil(
+                            context,
+                            MaterialPageRoute(builder: (_) => const GuardLoginScreen()),
+                                (route) => false
+                        );
+                      },
                     )
                   ],
                 ),
@@ -233,12 +277,12 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
                     decoration: BoxDecoration(
                         shape: BoxShape.circle,
                         border: Border.all(
-                            color: _accentColor.withValues(alpha: 0.3),
+                            color: currentAccent.withOpacity(0.3), // 👈 Dynamic
                             width: 2
                         ),
                         boxShadow: [
                           BoxShadow(
-                              color: _accentColor.withValues(alpha: 0.2),
+                              color: currentAccent.withOpacity(0.2), // 👈 Dynamic
                               blurRadius: 40,
                               spreadRadius: 5
                           )
@@ -252,12 +296,12 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
                     decoration: BoxDecoration(
                       color: Colors.black26,
                       shape: BoxShape.circle,
-                      border: Border.all(color: _accentColor, width: 4),
+                      border: Border.all(color: currentAccent, width: 4), // 👈 Dynamic
                     ),
                     child: Center(
                       child: _isProcessing
-                          ? CircularProgressIndicator(color: _accentColor, strokeWidth: 5)
-                          : Icon(_centerIcon, size: 80, color: _accentColor),
+                          ? CircularProgressIndicator(color: currentAccent, strokeWidth: 5)
+                          : Icon(_centerIcon, size: 80, color: currentAccent),
                     ),
                   ),
                 ],
@@ -291,7 +335,7 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
 
               const Spacer(),
 
-              // 4. BOTTOM CONTROLS (Only visible if not verifying)
+              // 4. BOTTOM CONTROLS
               if (!_isProcessing && !_showResult)
                 Padding(
                   padding: const EdgeInsets.all(30),
@@ -301,7 +345,7 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
                         _buildActionButton(
                             "SCAN NFC CARD",
                             Icons.wifi_tethering,
-                            Colors.cyanAccent,
+                            currentAccent, // 👈 Dynamic
                             Colors.black,
                             _startNfcScan
                         ),
@@ -320,7 +364,7 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
                   ),
                 ),
 
-              // 5. RESET BUTTON (Fix applied here!)
+              // 5. RESET BUTTON
               if (_showResult)
                 Padding(
                   padding: const EdgeInsets.all(30),
@@ -329,7 +373,7 @@ class _ScannerDashboardState extends State<ScannerDashboard> with WidgetsBinding
                       Icons.refresh,
                       Colors.white,
                       Colors.black,
-                      _checkHardware // <--- THE FIX: Re-run hardware check, don't just reset text
+                      _checkHardware
                   ),
                 ),
             ],
