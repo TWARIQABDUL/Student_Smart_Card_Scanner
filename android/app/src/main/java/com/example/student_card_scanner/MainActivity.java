@@ -58,6 +58,7 @@ public class MainActivity extends FlutterActivity {
                                         cardReader = new StudentCardReader(this);
                                     }
                                     cardReader.startScanning(new StudentCardCallback() {
+                                        
                                         @Override
                                         public void onScanSuccess(String studentId) {
                                             runOnUiThread(() -> {

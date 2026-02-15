@@ -5,9 +5,12 @@ class ScannerService {
 
   Future<String> startScan() async {
     try {
+      print("Starting scan...");
       final String token = await platform.invokeMethod('startScan');
+      print("Scan result: $token");
       return token;
     } on PlatformException catch (e) {
+      print("Scan failed: ${e.message}");
       throw e.message ?? "Scan failed";
     }
   }
